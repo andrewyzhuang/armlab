@@ -5,6 +5,11 @@ import time
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
+class Waypoint:
+
+    def __init__(self, joint_angles, gripper_state):
+        self.joint_angles = joint_angles
+        self.gripper_state = gripper_state
 
 class StateMachine:
 
@@ -14,6 +19,8 @@ class StateMachine:
         self.status_message = "Idle - waiting for input."
         self.current_state = "idle"
         self.next_state = "idle"
+        self.gripper_state = "open"
+        self.waypoints = list()
 
         self._handlers = {
             "initial_pose":      self.initial_pose,
@@ -80,21 +87,46 @@ class StateMachine:
         self._go_idle(message)
 
     def add_waypoint(self):
-        # TODO: student lab
         # Each waypoint stores joint angles + gripper state together.
         # Two consecutive waypoints can have identical joint angles but different gripper states
         # (e.g. WP: arm at grasp position, gripper open -> next WP: same position, gripper closed).
         # Playback executes each waypoint sequentially: move joints first, then apply gripper state.
-        self._go_idle("Student lab: implement add_waypoint() - record joint angles + gripper state.")
+        joint_angles = self.arm.get_joint_angles()
+        new_wp = Waypoint(joint_angles, self.gripper_state)
+        self.waypoints.append(new_wp)
 
     def clear_waypoints(self):
-        # TODO: student lab
-        self._go_idle("Student lab: implement clear_waypoints() - erase all recorded waypoints.")
+        self.waypoints = list()
 
     def playback_waypoints(self):
-        # TODO: student lab
         # For each waypoint: move to joint angles (wait), then apply gripper state (wait), then advance.
-        self._go_idle("Student lab: implement playback_waypoints() - replay waypoints in order.")
+        for waypoint in self.waypoints:
+
+            self.arm.set_joint_angles(waypoint.joint_angles)
+            time.sleep(0.5)
+            
+            match waypoint.gripper_state:
+
+                case "open":
+                    self.open_gripper()
+
+                case "close":
+                    self.close_gripper()
+
+                case "off":
+                    self.stop_gripper()
+
+    def open_gripper(self):
+        self.arm.open_gripper(wait=True)
+        self.gripper_state = "open"
+
+    def close_gripper(self):
+        self.arm.close_gripper(wait=True)
+        self.gripper_state = "close"
+
+    def stop_gripper(self):
+        self.arm.stop_gripper()
+        self.gripper_state = "off"
 
     def pick_place(self):
         # TODO: student lab
