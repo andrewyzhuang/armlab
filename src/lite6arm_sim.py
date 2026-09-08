@@ -227,7 +227,7 @@ class SimArm:
 
     # --- Motion ---
 
-    def set_joint_angles(self, joint_angles_rad):
+    def set_joint_angles(self, joint_angles_rad, wait=False):
         # Send all 6 joint angles (rad) to the sim as a speed/accel-limited servo move.
         if not (self.connected and self.initialized):
             return

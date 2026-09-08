@@ -1,9 +1,14 @@
 """
 State machine for the arm lab runtime shell.
 """
+import csv
+import os
 import time
 
 from PyQt5.QtCore import QThread, pyqtSignal
+
+# Coded by Claude
+WAYPOINTS_CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "waypoints.csv")
 
 class Waypoint:
 
@@ -92,18 +97,52 @@ class StateMachine:
         # (e.g. WP: arm at grasp position, gripper open -> next WP: same position, gripper closed).
         # Playback executes each waypoint sequentially: move joints first, then apply gripper state.
         joint_angles = self.arm.get_joint_angles()
-        new_wp = Waypoint(joint_angles, self.gripper_state)
+
+        if joint_angles is None:
+            self._go_idle("Joint angles not recovered from function")
+            return
+
+        if self.current_state != "add_waypoint":
+            self.current_state = "add_waypoint"
+
+        new_wp = Waypoint(list(joint_angles), self.gripper_state)
         self.waypoints.append(new_wp)
+        self._save_waypoints_csv()
+
+        self._go_idle(f"Waypoint {len(self.waypoints)} recorded "
+                      f"Joint angles: {list(joint_angles)}, gripper: {self.gripper_state}")
+
 
     def clear_waypoints(self):
+        wp = len(self.waypoints)
         self.waypoints = list()
+        self._go_idle(f"Cleared {wp} waypoints")
+
+    # Coded by Claude
+    def _save_waypoints_csv(self):
+        with open(WAYPOINTS_CSV_PATH, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["index", "joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "gripper_state"])
+            for i, wp in enumerate(self.waypoints):
+                writer.writerow([i, *wp.joint_angles, wp.gripper_state])
 
     def playback_waypoints(self):
         # For each waypoint: move to joint angles (wait), then apply gripper state (wait), then advance.
+        
+        if not self.arm.connected or not self.arm.initialized:
+            self._go_idle("Playback waypoints unavailable until the arm is initialized.")
+            return
+
+        if not self.waypoints:
+            self._go_idle("No waypoints to playback.")
+            return
+
+        # Uncomment if gripper does not move!
+        # self.arm.enable()
+        
         for waypoint in self.waypoints:
 
-            self.arm.set_joint_angles(waypoint.joint_angles)
-            time.sleep(0.5)
+            self.arm.set_joint_angles(waypoint.joint_angles, wait=True)
             
             match waypoint.gripper_state:
 
@@ -115,6 +154,8 @@ class StateMachine:
 
                 case "off":
                     self.stop_gripper()
+
+        self._go_idle(f"Playback complete: finished {len(self.waypoints)} waypoints")
 
     def open_gripper(self):
         self.arm.open_gripper(wait=True)

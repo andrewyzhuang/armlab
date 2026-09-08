@@ -98,7 +98,7 @@ class Lite6Arm:
 
     # --- Motion ---
 
-    def set_joint_angles(self, joint_angles_rad):
+    def set_joint_angles(self, joint_angles_rad, wait=False):
         # Send all 6 joint angles (rad) as a non-blocking move.
         if not self.connected or not self.initialized:
             return
@@ -106,7 +106,7 @@ class Lite6Arm:
             angle=joint_angles_rad,
             speed=self.speed_pct / 100.0 * np.pi,
             mvacc=self.mvacc_rad_s2,
-            wait=False,
+            wait=wait,
         )
 
     def enter_jog_mode(self):
