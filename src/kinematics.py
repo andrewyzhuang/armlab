@@ -7,6 +7,7 @@ TODO: Implement all functions marked with TODO below.
 """
 
 import numpy as np
+from numpy import *
 from scipy.linalg import expm
 from scipy.optimize import least_squares
 
@@ -18,12 +19,12 @@ from scipy.optimize import least_squares
 # Standard DH parameters for the UFactory Lite 6: https://docs.supportarticle.ufactory.cc/support_articles/developer/kinematic-and-dynamic-parameters/lite6.html
 # One row per joint: [theta_offset (rad), d (mm), alpha (rad), a (mm)]
 DH_STD = np.array([
-    [0.0, 0.0, 0.0, 0.0], # TODO: student lab
-    [0.0, 0.0, 0.0, 0.0],
-    [0.0, 0.0, 0.0, 0.0],
-    [0.0, 0.0, 0.0, 0.0],
-    [0.0, 0.0, 0.0, 0.0],
-    [0.0, 0.0, 0.0, 0.0],
+    [0.0, 243.3, -pi/2, 0.0],
+    [-pi/2, 0.0, pi, 200],
+    [-pi/2, 0.0, pi/2, 87],
+    [0.0, 227.6, pi/2, 0.0],
+    [0.0, 0.0, -pi/2, 0.0],
+    [0.0, 61.5, 0.0, 0.0],
 ], dtype=float)
 
 # Lite 6 joint travel limits, matching the MuJoCo model
@@ -52,8 +53,15 @@ def get_transform_from_dh(theta_offset, d, alpha, a, joint_angle):
         theta_offset (rad), d (mm), alpha (rad), a (mm)
     joint_angle: current joint angle in radians.
     """
-    # TODO: student lab
-    pass
+
+    theta = theta_offset + joint_angle
+
+    T = np.array([[cos(theta), -sin(theta)*cos(alpha), sin(theta)*sin(alpha), a*cos(theta)],
+         [sin(theta), cos(theta)*cos(alpha), -cos(theta)*sin(alpha), a*sin(theta)],
+         [0, sin(alpha), cos(alpha), d],
+         [0, 0, 0, 1]], dtype=float)
+    
+    return T
 
 
 def FK_dh(dh_params, joint_angles_rad, num_joints):
@@ -69,8 +77,15 @@ def FK_dh(dh_params, joint_angles_rad, num_joints):
 
     Returns 4x4 homogeneous transform (base -> end-effector).
     """
-    # TODO: student lab
-    pass
+    M = np.eye(4)
+
+    for i in range(num_joints):
+
+        theta_off, d, alpha, a = dh_params[i]
+        M = M @ get_transform_from_dh(theta_off, d, alpha, a, joint_angles_rad[i])
+
+    return M
+
 
 
 # ======================================================================
@@ -83,9 +98,9 @@ def FK_dh(dh_params, joint_angles_rad, num_joints):
 # Units are mm, like FK_dh.
 
 M = np.array([
-    [1, 0, 0, 0],  # TODO: student lab
-    [0, 1, 0, 0],
-    [0, 0, 1, 0],
+    [1, 0, 0, 87],  # TODO: student lab
+    [0, -1, 0, 0],
+    [0, 0, -1, 154.2],
     [0, 0, 0, 1],
 ], dtype=float)
 
@@ -139,9 +154,12 @@ def get_pose_from_T(T):
 
     Used by both FK_dh and FK_pox to produce the pose vector for the GUI.
     """
-    # TODO: student lab
-    return [0, 0, 0, 0, 0, 0]
-
+    phi = float(atan2(T[2, 1], T[2, 2]))
+    theta = float(atan2(-T[2, 0], sqrt(T[0, 0]**2 + T[1, 0]**2)))
+    psi = float(atan2(T[1, 0], T[0, 0]))
+    x, y, z = T[:3, 3]
+    
+    return [x, y, z, phi, theta, psi]
 
 # ======================================================================
 # IK - Geometric Method
@@ -186,6 +204,66 @@ def IK_numerical(dh_params, pose, q0=None, joint_limits=None, w_rot=200.0):
     # TODO: student lab
     return None
 
+def rot_matrix(phi, theta, psi):
+    """
+    Build the 3x3 rotation matrix R = Rz(psi) @ Ry(theta) @ Rx(phi),
+    the fixed-angle (roll-pitch-yaw about fixed X, Y, Z) convention used
+    by get_pose_from_T.
+    """
+    return np.array([
+        [cos(psi)*cos(theta), cos(psi)*sin(theta)*sin(phi) - sin(psi)*cos(phi), cos(psi)*sin(theta)*cos(phi) + sin(psi)*sin(phi)],
+        [sin(psi)*cos(theta), sin(psi)*sin(theta)*sin(phi) + cos(psi)*cos(phi), sin(psi)*sin(theta)*cos(phi) - cos(psi)*sin(phi)],
+        [-sin(theta), cos(theta)*sin(phi), cos(theta)*cos(phi)],
+    ], dtype=float)
+
+def error_test(arm, iterations=100):
+
+    lower = JOINT_LIMITS_DEG[:, 0]
+    upper = JOINT_LIMITS_DEG[:, 1]
+    qs = np.zeros((iterations, 6))
+    pos_err = np.zeros(iterations)
+    or_err = np.zeros(iterations)
+
+    for i in range(iterations):
+
+        q = np.random.uniform(low=lower, high=upper)
+
+        code, pose_sdk = arm.xarm.get_forward_kinematics(q)
+        if code != 0:
+            continue
+        pose_sdk = np.array(pose_sdk)
+
+        our_pose = np.array(get_pose_from_T(FK_dh(DH_STD, q, 6)))
+        qs[i] = q
+        pos_err[i] = np.linalg.norm(pose_sdk[:3] - our_pose[:3])
+
+        rot_sdk = rot_matrix(*pose_sdk[3:])
+        our_rot = rot_matrix(*our_pose[3:])
+
+        r_err = our_rot.T @ rot_sdk
+        or_err[i] = arccos((trace(r_err) - 1) / 2)
+
+    or_err = np.degrees(or_err)
+    print(f"Position Error Mean: {np.mean(pos_err)}, Median: {np.median(pos_err)}, Max: {np.max(pos_err)}, 95%: {np.percentile(pos_err, 95)}")
+    print(f"Orientation Error Mean: {np.mean(or_err)}, Median: {np.median(or_err)}, Max: {np.max(or_err)}, 95%: {np.percentile(or_err, 95)}")
+
+    import matplotlib.pyplot as plt
+
+    plt.figure()
+    plt.hist(pos_err, bins=30)
+    plt.xlabel("Position error (mm)")
+    plt.ylabel("Count")
+    plt.title("Position error histogram")
+
+    fig, axes = plt.subplots(2, 3, figsize=(12, 6))
+    for j, ax in enumerate(axes.flat):
+        ax.scatter(qs[:, j], pos_err, s=10)
+        ax.set_xlabel(f"Joint {j+1} (deg)")
+        ax.set_ylabel("Position error (mm)")
+    fig.tight_layout()
+
+    plt.show()
+
 
 # ======================================================================
 # Standalone test
@@ -193,7 +271,9 @@ def IK_numerical(dh_params, pose, q0=None, joint_limits=None, w_rot=200.0):
 
 if __name__ == '__main__':
     # get_transform_from_dh with all zeros should return identity
+
     T = get_transform_from_dh(0, 0, 0, 0, 0)
+
     if T is not None:
         print("get_transform_from_dh(all zeros):")
         print(T)

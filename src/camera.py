@@ -24,10 +24,10 @@ WORKSPACE_MARGIN_MM = 50.0
 # Students can adjust these for their physical station.
 # TODO: student lab - adjust thest to match new workspace tag locations.
 TAG_WORLD_POINTS = {
-    1: (0.0,  250.0, 0.0),
-    2: (0.0, -250.0, 0.0),
-    3: (300.0, -250.0, 0.0),
-    4: (300.0, 250.0, 0.0),
+    1: (100.0,  300.0, 0.0),
+    2: (100.0, -300.0, 0.0),
+    3: (400.0, -300.0, 0.0),
+    4: (400.0,  300.0, 0.0),
 }
 
 class Camera:
@@ -146,8 +146,18 @@ class Camera:
         self.depth_frame_rgb = colorized
 
     def draw_tags_in_rgb_image(self):
-        # TODO: student lab
+
         self.tag_image_frame = self.video_frame.copy()
+        for detection in self.tag_detections:
+
+            center = tuple(detection.center.astype(int))
+            cv2.circle(self.tag_image_frame, center, 5, (0, 0, 255), -1)
+
+            corners = list(detection.corners.astype(int))
+            cv2.rectangle(self.tag_image_frame, corners[0], corners[2], (0, 255, 0), 2)
+
+            cv2.putText(self.tag_image_frame, f"{detection.tag_id}", center, cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+
 
     def estimate_extrinsics_from_tags(self):
         """
