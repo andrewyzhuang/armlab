@@ -22,7 +22,6 @@ TAG_SIZE_MM = 25.0
 WORKSPACE_MARGIN_MM = 50.0
 # Known workspace tag centers in millimeters in the robot/world frame.
 # Students can adjust these for their physical station.
-# TODO: student lab - adjust thest to match new workspace tag locations.
 TAG_WORLD_POINTS = {
     1: (100.0,  300.0, 0.0),
     2: (100.0, -300.0, 0.0),
@@ -161,25 +160,91 @@ class Camera:
 
     def estimate_extrinsics_from_tags(self):
         """
-        Uses AprilTag centers and known world-frame tag locations to estimate a
+        Uses AprilTag corners and known world-frame tag locations to estimate a
         camera-to-world transform. The result is stored in memory only and also
         printed to the terminal every time the user clicks Calibrate.
         """
         if not self.camera_connected:
             return False, "Camera offline - cannot calibrate."
 
-        # TODO: student lab
-        return False, "Student lab: implement estimate_extrinsics_from_tags()."
+        # pupil_apriltags orders detection.corners counter-clockwise starting at
+        # the tag's bottom-left corner: bottom-left, bottom-right, top-right,
+        # top-left. Build the matching world-frame corner offsets (tags assumed
+        # to lie flat, axis-aligned with the world X/Y axes) from TAG_SIZE_MM.
+        half = TAG_SIZE_MM / 2.0
+        corner_offsets = np.array([
+            [-half, -half, 0.0],
+            [ half, -half, 0.0],
+            [ half,  half, 0.0],
+            [-half,  half, 0.0],
+        ])
+
+        # Given tags detected in the image and their known world positions, solve for the transform between the two frames.
+        world_pts = []
+        img_pts = []
+
+        for detection in self.tag_detections:
+            center = self.tag_world_points.get(detection.tag_id)
+            if center is None:
+                continue
+            center = np.array(center)
+            for offset, corner in zip(corner_offsets, detection.corners):
+                world_pts.append(center + offset)
+                img_pts.append(corner)
+
+        world_pts = np.array(world_pts, dtype=np.float64)
+        img_pts = np.array(img_pts, dtype=np.float64)
+
+        if len(world_pts) < 4:
+            return False, "Not enough AprilTag corners detected to calibrate."
+
+        # Solve PnP
+        success, rvec, tvec = cv2.solvePnP(
+            world_pts,
+            img_pts,
+            self.intrinsic_matrix,
+            distCoeffs=None,
+            flags=cv2.SOLVEPNP_ITERATIVE
+        )
+
+        if success:
+            R, _ = cv2.Rodrigues(rvec)
+
+            self.extrinsic_matrix = np.eye(4, dtype=float)
+            self.extrinsic_matrix[:3, :3] = R
+            self.extrinsic_matrix[:3, 3] = tvec.ravel()
+
+            self.extrinsic_matrix_inv = np.linalg.inv(self.extrinsic_matrix)
+            self.camera_calibrated = True
+
+            cam_pos_world = self.extrinsic_matrix_inv[:3, 3]
+            print(self.extrinsic_matrix_inv)
+            return True, f"Calibrated! Camera position in World Frame: ({cam_pos_world[0]:.1f}, {cam_pos_world[1]:.1f}, {cam_pos_world[2]:.1f})"
+
+        return False, f"solvePnP failed to converge."
 
     def depth_to_camera_point(self, x, y, depth_raw):
         """Convert an image pixel + raw depth unit to a camera-frame 3D point (mm)."""
-        # TODO: student lab
+        # a pixel plus a raw depth reading, to a 3D point in the camera frame.
+        z_c = depth_raw
+        if z_c <= 0:
+            return None
+
+        fx, fy = self.intrinsic_matrix[0,0], self.intrinsic_matrix[1,1]
+        cx, cy = self.intrinsic_matrix[0,2], self.intrinsic_matrix[1,2]
+        x_c = (x - cx) * z_c / fx
+        y_c = (y - cy) * z_c / fy
+        return np.array([x_c, y_c, z_c, 1.0])
+
         return None
 
     def camera_to_world(self, camera_point):
         """Convert a camera-frame 3D point to a world-frame 3D point."""
-        # TODO: student lab
-        return None
+        if camera_point is None:
+            return None
+
+        world_pt = (self.extrinsic_matrix_inv @ camera_point)[:3]
+        return world_pt
 
     def image_to_world(self, x, y):
         """Pixel (x, y) -> world-frame (X, Y, Z) in mm using live depth."""

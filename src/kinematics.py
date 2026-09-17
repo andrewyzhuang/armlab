@@ -98,19 +98,19 @@ def FK_dh(dh_params, joint_angles_rad, num_joints):
 # Units are mm, like FK_dh.
 
 M = np.array([
-    [1, 0, 0, 87],  # TODO: student lab
+    [1, 0, 0, 87],
     [0, -1, 0, 0],
     [0, 0, -1, 154.2],
     [0, 0, 0, 1],
 ], dtype=float)
 
 S_list = np.array([
-    [0, 0, 0, 0, 0, 0],  # TODO: student lab
-    [0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0],
-    [0, 0, 0, 0, 0, 0],
+    [0, 0, 1, 0, 0, 0],
+    [0, 1, 0, -243.3, 0, 0],
+    [0, -1, 0, 443.3, 0, 0],
+    [0, 0, -1, 0, 87, 0],
+    [0, 1, 0, -215.7, 0, 87],
+    [0, 0, -1, 0, 87, 0],
 ], dtype=float)
 
 
@@ -121,6 +121,16 @@ def to_s_matrix(w, v):
     v: (3,) linear velocity component
     """
     # TODO: student lab
+
+    omega_hat = np.array([[0 , -1 * w[2], w[1]], 
+                      [w[2], 0, -1 * w[0]], 
+                      [-1 * w[1], w[0], 0],
+                      ] , dtype=float )
+
+    s = np.zeros((4,4))
+    s[:3,:3]  = omega_hat
+    s[:3, 3] = v
+    return s
     pass
 
 
@@ -137,7 +147,25 @@ def FK_pox(joint_angles_rad, m_mat, s_lst):
     Returns 4x4 homogeneous transform (base -> end-effector).
     """
     # TODO: student lab
-    pass
+    T = np.array([
+    [1, 0, 0, 0],  # TODO: student lab
+    [0, 1, 0, 0],
+    [0, 0, 1, 0],
+    [0, 0, 0, 1],
+    ], dtype=float)
+
+    w = s_lst[:, :3]
+    v = s_lst[:, -3:]
+
+    for i in range(len(joint_angles_rad)):
+        joint_w = w[i, :]
+        joint_v = v[i, :]
+        s = to_s_matrix(joint_w, joint_v)
+        T = T @ expm(s * joint_angles_rad[i])
+
+    T = T @ m_mat
+
+    return T
 
 
 # ======================================================================
@@ -233,7 +261,7 @@ def error_test(arm, iterations=100):
             continue
         pose_sdk = np.array(pose_sdk)
 
-        our_pose = np.array(get_pose_from_T(FK_dh(DH_STD, q, 6)))
+        our_pose = np.array(get_pose_from_T(FK_pox(q, M, S_list)))
         qs[i] = q
         pos_err[i] = np.linalg.norm(pose_sdk[:3] - our_pose[:3])
 
