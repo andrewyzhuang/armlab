@@ -32,7 +32,7 @@ class Gui(QMainWindow):
         self.sm     = StateMachine(self.arm, self.camera)
 
         # --- View state ---
-        self._current_frames = {"video": None, "depth": None, "tags": None, "workspace": None}
+        self._current_frames = {"video": None, "depth": None, "tags": None, "workspace": None, "grid": None}
         self._pre_manual_widget_states = {}  # restore panel states after manual mode
 
         # --- Wire jog buttons (widget pairs defined in layout) ---
@@ -54,6 +54,7 @@ class Gui(QMainWindow):
         self.ui.btn_stop_gripper.clicked.connect(self.sm.stop_gripper)
         self.ui.btn_sleep_arm.clicked.connect(self._sleep_arm)
         self.ui.btn_calibrate.clicked.connect(partial(self.sm.set_next_state, "calibrate"))
+        self.ui.chk_heat_map.stateChanged.connect(self._heat_map_chk)
         self.ui.chk_pick_place.stateChanged.connect(self._pick_place_chk)
         self.ui.btn_add_wp.clicked.connect(partial(self.sm.set_next_state, "add_waypoint"))
         self.ui.btn_clear_wps.clicked.connect(partial(self.sm.set_next_state, "clear_waypoints"))
@@ -135,6 +136,7 @@ class Gui(QMainWindow):
         if self.ui.radioVideo.isChecked():  return "video"
         if self.ui.radioDepth.isChecked():  return "depth"
         if self.ui.radioTags.isChecked():   return "tags"
+        if self.ui.radioGrid.isChecked():   return "grid"
         return "workspace"
 
     def _render_current_frame(self):
@@ -362,13 +364,14 @@ class Gui(QMainWindow):
         self.ui.rdoutTheta.setText(f"{np.degrees(pose[4]):+.2f}°")
         self.ui.rdoutPsi.setText(f"{np.degrees(pose[5]):+.2f}°")
 
-    @pyqtSlot(QImage, QImage, QImage, QImage)
-    def _set_image(self, rgb_image, depth_image, tag_image, grid_image):
+    @pyqtSlot(QImage, QImage, QImage, QImage, QImage)
+    def _set_image(self, rgb_image, depth_image, tag_image, workspace_image, grid_image):
         """Store new camera frames and render the selected one."""
         self._current_frames["video"]     = rgb_image
         self._current_frames["depth"]     = depth_image
         self._current_frames["tags"]      = tag_image
-        self._current_frames["workspace"] = grid_image
+        self._current_frames["workspace"] = workspace_image
+        self._current_frames["grid"]      = grid_image
         self._render_current_frame()
 
     # --- Slots: arm actions ---
@@ -467,6 +470,10 @@ class Gui(QMainWindow):
             self._set_status_message("Pick & Place ON - click an object in the video feed.")
         else:
             self.sm.set_next_state("idle")
+
+    def _heat_map_chk(self, state):
+        """Turn the workspace-view Z-height heat map overlay on or off."""
+        self.camera.heat_map_enabled = (state == Qt.Checked)
 
     def _initial_pose(self):
         """Leave direct control and request the initial arm pose."""
