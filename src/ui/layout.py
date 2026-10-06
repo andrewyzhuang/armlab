@@ -166,8 +166,7 @@ class Ui_MainWindow:
         for obj, text, checked in [('radioVideo',     'RGB',       True),
                                     ('radioDepth',     'Depth',     False),
                                     ('radioTags',      'Tags',      False),
-                                    ('radioWorkspace', 'Workspace', False),
-                                    ('radioGrid',      'Grid',      False)]:
+                                    ('radioWorkspace', 'Workspace', False)]:
             rb = QRadioButton(text)
             rb.setObjectName(obj)
             rb.setChecked(checked)
@@ -515,6 +514,15 @@ class Ui_MainWindow:
         self.chk_heat_map.setObjectName('chk_heat_map')
         heat_map_row.addWidget(self.chk_heat_map)
         cam.addLayout(heat_map_row)
+
+        grid_row = QHBoxLayout()
+        grid_row.setSpacing(10)
+        grid_row.addWidget(_label('Grid', role='ink', bold=True, pt=11))
+        grid_row.addStretch()
+        self.chk_grid = ToggleSwitch()
+        self.chk_grid.setObjectName('chk_grid')
+        grid_row.addWidget(self.chk_grid)
+        cam.addLayout(grid_row)
 
         # --- Card: Mode Select ---
         auto_frame, auto = _card(padding=(14, 14, 14, 14), spacing=6)

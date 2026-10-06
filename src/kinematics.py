@@ -194,21 +194,96 @@ def get_pose_from_T(T):
 # ======================================================================
 
 def IK_geometric(dh_params, pose):
-    """
-    Inverse kinematics for the Lite 6.
+    """Closed-form IK for the Lite 6 (spherical wrist)."""
+    x, y, z, phi, theta, psi_rpy = pose
+    R_target = rot_matrix(phi, theta, psi_rpy)
 
-    pose: [x, y, z, phi, theta, psi]  (mm, radians).
+    # --- DH constants read from the table (never hard-code) ---
+    d1          = dh_params[0, 1]
+    a2          = dh_params[1, 3]
+    theta_off_2 = dh_params[1, 0]
+    alpha_2     = dh_params[1, 2]
+    a3          = dh_params[2, 3]
+    theta_off_3 = dh_params[2, 0]
+    alpha_3     = dh_params[2, 2]
+    d4          = dh_params[3, 1]
+    d6          = dh_params[5, 1]
 
-    Returns joint angles in radians as a numpy array of length 6,
-    or None if the pose is not reachable.
-    """
-    # TODO: student lab
-    return None
+    # --- 1. wrist center ---
+    p_wc = np.array([x, y, z], dtype=float) - d6 * R_target[:, 2]
+
+    # --- 2. joint 1 ---
+    r = float(np.hypot(p_wc[0], p_wc[1]))
+    if r < 1e-6:
+        theta1 = 0.0
+    else:
+        theta1 = float(np.arctan2(p_wc[1], p_wc[0]))
+
+    # --- 3. planar 2-link for joints 2,3 ---
+    s = p_wc[2] - d1
+    L = float(np.hypot(r, s))
+    L2 = float(np.hypot(a3, d4))
+    psi_link = float(np.arctan2(d4, a3))
+
+    if L > a2 + L2 or L < abs(a2 - L2) or L < 1e-6:
+        return None
+
+    cos_gamma = (a2 * a2 + L2 * L2 - L * L) / (2.0 * a2 * L2)
+    cos_beta  = (a2 * a2 + L * L   - L2 * L2) / (2.0 * a2 * L)
+    gamma = float(np.arccos(np.clip(cos_gamma, -1.0, 1.0)))
+    beta  = float(np.arccos(np.clip(cos_beta,  -1.0, 1.0)))
+
+    alpha = float(np.arctan2(r, s))
+    theta2 = alpha - beta
+    theta3 = gamma + psi_link - np.pi / 2.0
+
+    # --- 4. wrist orientation ---
+    T_01 = get_transform_from_dh(0.0,           d1, -np.pi / 2.0, 0.0,  theta1)
+    T_12 = get_transform_from_dh(theta_off_2,   0.0, np.pi,        a2,   theta2)
+    T_23 = get_transform_from_dh(theta_off_3,   0.0, np.pi / 2.0,  a3,   theta3)
+    R_03 = (T_01 @ T_12 @ T_23)[:3, :3]
+
+    R_36 = R_03.T @ R_target
+
+    c5 = float(np.clip(R_36[2, 2], -1.0, 1.0))
+    theta5 = float(np.arccos(c5))
+    s5 = float(np.sin(theta5))
+
+    if abs(s5) < 1e-6:
+        # wrist singularity: joints 4 and 6 are coupled, pick theta4 = 0
+        theta4 = 0.0
+        if c5 > 0.0:
+            theta6 = float(np.arctan2( R_36[1, 0],  R_36[0, 0]))
+        else:
+            theta6 = float(np.arctan2( R_36[1, 0], -R_36[0, 0]))
+    else:
+        theta4 = float(np.arctan2(-R_36[1, 2], -R_36[0, 2]))
+        theta6 = float(np.arctan2(-R_36[2, 1],  R_36[2, 0]))
+
+    result = np.array([theta1, theta2, theta3, theta4, theta5, theta6])
+
+    # --- 5. joint limits ---
+    if not np.all((result >= JOINT_LIMITS[:, 0]) & (result <= JOINT_LIMITS[:, 1])):
+        return None
+
+    return result
 
 
 # ======================================================================
 # IK - Numerical Method (bounded Gauss-Newton)
 # ======================================================================
+
+def compute_jacobian(dh_params, q, residual_func, base_res, eps=1e-6):
+    """Computes the 6x6 numerical Jacobian using finite differences."""
+    J = np.zeros((6, 6))
+    for i in range(6):
+        q_perturbed = q.copy()
+        q_perturbed[i] += eps
+        res_perturbed = residual_func(q_perturbed)
+        # Forward finite difference
+        J[:, i] = (res_perturbed - base_res) / eps
+    return J
+
 
 def IK_numerical(dh_params, pose, q0=None, joint_limits=None, w_rot=200.0):
     """
@@ -229,8 +304,84 @@ def IK_numerical(dh_params, pose, q0=None, joint_limits=None, w_rot=200.0):
     Returns joint angles in radians as a numpy array of length 6,
     or None if the pose is not reachable.
     """
-    # TODO: student lab
+    
+    if q0 is None:
+        q0 = Q_DEFAULT
+    q = np.array(q0, dtype=float).copy()
+    
+    if joint_limits is None:
+        joint_limits = JOINT_LIMITS
+    lo = joint_limits[:, 0]
+    hi = joint_limits[:, 1]
+    
+    # Custom optimization loop hyperparameters
+    max_steps = 150
+    pos_tol = 0.1       # 0.1 mm position accuracy limit
+    rot_tol = 0.005     # 0.005 rad orientation accuracy limit
+    damping = 1e-4      # Levenberg-Marquardt damping factor to pass wrist singularities
+
+    x, y, z, phi, theta, psi_rpy = pose
+    R_target = rot_matrix(phi, theta, psi_rpy)
+    p_target = np.array([x, y, z], dtype=float)
+
+    def calculate_residual(q_curr):
+        """Six-vector: [position_err (mm), w_rot * rotation_vec (mm-equivalent)]."""
+        T = FK_dh(dh_params, q_curr, 6)
+        p = T[:3, 3]
+        R = T[:3, :3]
+
+        e_pos = p - p_target
+
+        # Rotation vector of (R_target · R^T): the world-frame rotation
+        # needed to take the FK orientation to the target orientation.
+        R_err = R_target @ R.T
+        v = np.array([R_err[2, 1] - R_err[1, 2],
+                      R_err[0, 2] - R_err[2, 0],
+                      R_err[1, 0] - R_err[0, 1]])
+        n = float(np.linalg.norm(v))
+        
+        if n < 1e-12:
+            omega = np.zeros(3)
+        else:
+            angle = float(np.arctan2(n / 2.0, (np.trace(R_err) - 1.0) / 2.0))
+            omega = v / n * angle
+
+        return np.concatenate([e_pos, w_rot * omega])
+
+    # Initial seeding clip to enforce starting bounds sanity
+    q = np.clip(q, lo, hi)
+
+    for step in range(max_steps):
+        res = calculate_residual(q)
+        
+        # Pull separate physical metrics for convergence checks
+        e_pos_norm = np.linalg.norm(res[:3])
+        e_rot_norm = np.linalg.norm(res[3:]) / w_rot
+
+        # Check if the current joint state meets the assignment tolerances
+        if e_pos_norm <= pos_tol and e_rot_norm <= rot_tol:
+            return q
+
+        # Compute the 6x6 numerical Jacobian matrix
+        J = compute_jacobian(dh_params, q, calculate_residual, res)
+
+        # Solve damped normal equations (LM step update): (J^T*J + damping*I)*dq = -J^T*res
+        A = J.T @ J + damping * np.eye(6)
+        b = -J.T @ res
+        dq = np.linalg.solve(A, b)
+
+        # Step forward, then force boundary constraints via clipping
+        q += dq
+        q = np.clip(q, lo, hi)
+
+    # Final post-loop evaluation check 
+    res = calculate_residual(q)
+    if np.linalg.norm(res[:3]) <= pos_tol and (np.linalg.norm(res[3:]) / w_rot) <= rot_tol:
+        return q
+
+    # Return None if the target is unreachable or failed to converge within max steps
     return None
+
 
 def rot_matrix(phi, theta, psi):
     """
@@ -291,6 +442,182 @@ def error_test(arm, iterations=100):
     fig.tight_layout()
 
     plt.show()
+
+
+def _ik_pose_error(T_target, q):
+    """Position (mm) and orientation (deg) error between T_target and FK(q)."""
+    T = FK_dh(DH_STD, q, 6)
+    p_err = np.linalg.norm(T[:3, 3] - T_target[:3, 3])
+    R_err = T_target[:3, :3].T @ T[:3, :3]
+    o_err = np.degrees(arccos(np.clip((trace(R_err) - 1) / 2, -1.0, 1.0)))
+    return p_err, o_err
+
+
+def _ik_numerical_lsq(pose, q0=Q_DEFAULT, w_rot=200.0):
+    """Bounded least squares on [position error, w_rot * rotation-vector error], seeded from home."""
+    from scipy.spatial.transform import Rotation
+
+    lower, upper = JOINT_LIMITS[:, 0], JOINT_LIMITS[:, 1]
+    p_t = np.asarray(pose[:3], dtype=float)
+    R_t = rot_matrix(*pose[3:])
+
+    def residual(q):
+        T = FK_dh(DH_STD, q, 6)
+        rv = Rotation.from_matrix(R_t.T @ T[:3, :3]).as_rotvec()
+        return np.concatenate([T[:3, 3] - p_t, w_rot * rv])
+
+    q0 = np.clip(q0, lower + 1e-6, upper - 1e-6)
+    sol = least_squares(residual, q0, bounds=(lower, upper), xtol=1e-12, ftol=1e-12, gtol=1e-12)
+    T_t = np.eye(4)
+    T_t[:3, :3], T_t[:3, 3] = R_t, p_t
+    p_err, o_err = _ik_pose_error(T_t, sol.x)
+    if p_err > 0.1 or o_err > 0.01:
+        return None
+    return sol.x
+
+
+def _ik_round_trip(solvers, iterations, seed, title):
+    """
+    Draw random q inside JOINT_LIMITS, FK -> IK -> FK through each solver, and
+    compare poses (not angles: a different branch reaching the same pose is fine).
+    Prints mean/max position and orientation error per solver and plots histograms.
+    """
+    import matplotlib.pyplot as plt
+
+    rng = np.random.default_rng(seed)
+    qs = rng.uniform(JOINT_LIMITS[:, 0], JOINT_LIMITS[:, 1], size=(iterations, 6))
+    results = {name: {"pos": [], "ori": [], "fail": 0} for name in solvers}
+
+    for q in qs:
+        T_target = FK_dh(DH_STD, q, 6)
+        pose = get_pose_from_T(T_target)
+        for name, solve in solvers.items():
+            q_ik = solve(pose)
+            if q_ik is None:
+                results[name]["fail"] += 1
+                continue
+            p_err, o_err = _ik_pose_error(T_target, q_ik)
+            results[name]["pos"].append(p_err)
+            results[name]["ori"].append(o_err)
+
+    print(f"\n{title}: {iterations} random joint vectors (FK -> IK -> FK, pose compared)")
+    print(f"{'solver':<14}{'solved':>8}{'pos mean':>12}{'pos max':>12}{'ori mean':>12}{'ori max':>12}")
+    for name, r in results.items():
+        pos, ori = np.array(r["pos"]), np.array(r["ori"])
+        if len(pos) == 0:
+            print(f"{name:<14}{0:>8}  (no solutions)")
+            continue
+        print(f"{name:<14}{len(pos):>8}{pos.mean():>10.2e}mm{pos.max():>10.2e}mm"
+              f"{ori.mean():>9.2e}deg{ori.max():>9.2e}deg")
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+    for name, r in results.items():
+        if r["pos"]:
+            axes[0].hist(r["pos"], bins=30, alpha=0.6, label=name)
+            axes[1].hist(r["ori"], bins=30, alpha=0.6, label=name)
+    axes[0].set_xlabel("Position error (mm)")
+    axes[1].set_xlabel("Orientation error (deg)")
+    for ax in axes:
+        ax.set_ylabel("Count")
+        ax.legend()
+    fig.suptitle(title)
+    fig.tight_layout()
+
+    return results
+
+
+def error_test_ik(iterations=300, seed=0):
+    """
+    IK round trip inside our own model: IK_geometric vs the numerical solver.
+    No hardware needed, and no error floor - both should come back exact.
+    """
+    import matplotlib.pyplot as plt
+
+    solvers = {
+        "IK_geometric": lambda pose: IK_geometric(DH_STD, pose),
+        "IK_numerical": _ik_numerical_lsq,
+    }
+    results = _ik_round_trip(solvers, iterations, seed, "IK round trip (geometric vs numerical)")
+    plt.show()
+    return results
+
+
+def error_test_ik_vendor(arm, iterations=300, seed=0):
+    """
+    Same sweep through the vendor's arm.xarm.get_inverse_kinematics, checked
+    with our FK. Needs the real arm, but the arm never moves. The vendor uses a
+    per-arm factory calibration our model lacks, so allow up to 10 mm.
+    """
+    import matplotlib.pyplot as plt
+
+    def ik_vendor(pose):
+        code, q = arm.xarm.get_inverse_kinematics(list(pose))
+        return np.array(q[:6], dtype=float) if code == 0 else None
+
+    results = _ik_round_trip({"vendor (SDK)": ik_vendor}, iterations, seed, "IK vs vendor")
+    pos = np.array(results["vendor (SDK)"]["pos"])
+    if len(pos):
+        print(f"vendor: {np.mean(pos <= 10.0) * 100:.1f}% of solved poses within the 10 mm allowance")
+    plt.show()
+    return results
+
+
+def reachability_map(blocks=(38.0, 25.0), step=10.0, flange_above_center=85.0):
+    """
+    Top-down grasp reachability over the whole board using IK_geometric.
+
+    For each block size the flange sits flange_above_center mm above the block's
+    center, tool straight down (roll = pi, pitch = 0), and the gripper is tried
+    aligned to the board grid (yaw = 0) and turned 90 deg (yaw = pi/2). A point
+    is reachable if IK_geometric returns a solution inside the joint limits.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import ListedColormap
+    from matplotlib.patches import Rectangle, Circle
+
+    # Board extents, matching camera.py (MIN_X..MAX_X, MIN_Y..MAX_Y).
+    board_x, board_y = (-50.0, 450.0), (-450.0, 450.0)
+    xs = np.arange(board_x[0], board_x[1] + 1e-9, step)
+    ys = np.arange(board_y[0], board_y[1] + 1e-9, step)
+
+    maps = {}
+    for block in blocks:
+        z = block / 2.0 + flange_above_center
+        reach = np.zeros((len(ys), len(xs), 2), dtype=bool)   # [..., 0] aligned, [..., 1] turned 90 deg
+        for i, y in enumerate(ys):
+            for j, x in enumerate(xs):
+                for k, yaw in enumerate((0.0, pi / 2)):
+                    reach[i, j, k] = IK_geometric(DH_STD, [x, y, z, pi, 0.0, yaw]) is not None
+        maps[block] = reach
+        print(f"\n{block:.0f} mm block (flange z = {z:.1f} mm), {reach.shape[0] * reach.shape[1]} grid points:")
+        print(f"  aligned: {reach[..., 0].sum()}  turned 90: {reach[..., 1].sum()}  "
+              f"both: {(reach[..., 0] & reach[..., 1]).sum()}  either: {(reach[..., 0] | reach[..., 1]).sum()}")
+
+    if len(blocks) == 2:
+        diff = (maps[blocks[0]] != maps[blocks[1]]).any(axis=2).sum()
+        print(f"\nGrid points whose reachability differs between {blocks[0]:.0f} mm and {blocks[1]:.0f} mm: {diff}")
+
+    cmap = ListedColormap(["#d9d9d9", "#f4a259", "#5b8e7d"])   # neither, one orientation, both
+    fig, axes = plt.subplots(1, len(blocks), figsize=(6.5 * len(blocks), 6.5), sharey=True, squeeze=False)
+    for ax, (block, reach) in zip(axes[0], maps.items()):
+        ax.imshow(reach.sum(axis=2), origin="lower", cmap=cmap, vmin=0, vmax=2,
+                  extent=(xs[0] - step / 2, xs[-1] + step / 2, ys[0] - step / 2, ys[-1] + step / 2))
+        ax.add_patch(Rectangle((board_x[0], board_y[0]), board_x[1] - board_x[0], board_y[1] - board_y[0],
+                               fill=False, lw=2, ec="k"))
+        ax.add_patch(Circle((0, 0), 40, fc="k", ec="k"))
+        ax.annotate("base", (0, 0), xytext=(15, 50), textcoords="offset points")
+        ax.set_title(f"{block:.0f} mm block, flange z = {block / 2 + flange_above_center:.1f} mm")
+        ax.set_xlabel("x (mm)")
+        ax.set_aspect("equal")
+    axes[0, 0].set_ylabel("y (mm)")
+    handles = [Rectangle((0, 0), 1, 1, fc=c) for c in cmap.colors]
+    fig.legend(handles, ["unreachable", "one orientation only", "both orientations"],
+               loc="lower center", ncol=3)
+    fig.suptitle("Top-down grasp reachability (IK_geometric, within joint limits)")
+    fig.tight_layout(rect=(0, 0.06, 1, 1))
+
+    plt.show()
+    return maps
 
 
 # ======================================================================

@@ -29,6 +29,14 @@ TAG_WORLD_POINTS = {
     3: (400.0, -300.0, 0.0),
     4: (400.0,  300.0, 0.0),
 }
+
+CORNER_POINTS = np.array([
+            [303, 562],
+            [1088, 551],
+            [1154, 91],
+            [232, 112]
+        ]) # Corner points of our workspace
+CORNER_SAMPLE_RADIUS_PX = 10  # half-window for the median depth sample at each corner
 MAX_X = 450
 MIN_X = -50
 MAX_Y = 450
@@ -43,7 +51,6 @@ class Camera:
         self.depth_frame_rgb = np.zeros((COLOR_H, COLOR_W, 3), dtype=np.uint8)
         self.tag_image_frame = np.zeros((COLOR_H, COLOR_W, 3), dtype=np.uint8)
         self.workspace_frame = np.zeros((COLOR_H, COLOR_W, 3), dtype=np.uint8)
-        self.grid_frame = np.zeros((COLOR_H, COLOR_W, 3), dtype=np.uint8)
 
         # Camera Calibration: extrinsic_matrix maps world-frame homogeneous points
         # to camera-frame homogeneous points; extrinsic_matrix_inv does the reverse.
@@ -62,6 +69,16 @@ class Camera:
 
         # Toggled from the UI to overlay the Z-height heat map on the workspace view.
         self.heat_map_enabled = False
+        # Toggled from the UI to overlay the world-frame reference grid on the workspace view.
+        self.grid_enabled = False
+
+        # Best-fit plane (mm) of the sensor's depth error over the board, and
+        # depth_frame_raw with that error subtracted (what the depth view shows).
+        self.depth_bias_coeffs = None
+        self.depth_frame_adjusted = np.zeros((COLOR_H, COLOR_W), dtype=np.uint16)
+        # World Z (mm above the table) of every pixel, from depth_frame_adjusted.
+        # None until calibrated; NaN where there is no depth.
+        self.world_z_frame = None
 
         # AprilTag state
         self.tag_world_points = dict(TAG_WORLD_POINTS)
@@ -136,21 +153,26 @@ class Camera:
         self.pipeline.stop()
         self._pipeline_running = False
 
-    def colorize_depth_frame(self, depth_lo_mm=300.0, depth_hi_mm=1200.0):
-        # Jet colormap (blue=near, red=far); pixels outside range masked black.
-        depth_mm = self.depth_frame_raw.astype(np.float32) * self.depth_scale_mm
-        in_range = (depth_mm >= depth_lo_mm) & (depth_mm <= depth_hi_mm)
+    def colorize_depth_frame(self, depth_lo_mm=300.0, depth_hi_mm=1200.0, z_lo_mm=-20.0, z_hi_mm=200.0):
+        # Jet colormap; pixels outside range (or with no depth) masked black.
+        # Before calibration: colors show camera depth (blue=near, red=far).
+        # After calibration: colors show world Z height above the table (blue=low, red=high),
+        # in the same top-down view as the RGB workspace view.
+        values = self.depth_frame_adjusted.astype(np.float32) * self.depth_scale_mm
+        lo, hi = depth_lo_mm, depth_hi_mm
 
-        # stretch to the depth span actually present, so small real variations still show up
-        if np.any(in_range):
-            depth_lo_mm = depth_mm[in_range].min()
-            depth_hi_mm = max(depth_mm[in_range].max(), depth_lo_mm + 1e-3)
+        if self.world_z_frame is not None:
+            values = self.world_z_frame
+            lo, hi = z_lo_mm, z_hi_mm
 
-        normalized = np.zeros(depth_mm.shape, dtype=np.uint8)
-        normalized[in_range] = np.clip(
-            (depth_mm[in_range] - depth_lo_mm) / (depth_hi_mm - depth_lo_mm) * 255.0,
-            0, 255,
-        ).astype(np.uint8)
+        if self.workspace_homography is not None:
+            values = cv2.warpPerspective(values, self.workspace_homography, (COLOR_W, COLOR_H),
+                                         flags=cv2.INTER_NEAREST, borderValue=float("nan"))
+
+        in_range = (values >= lo) & (values <= hi)
+
+        normalized = np.zeros(values.shape, dtype=np.uint8)
+        normalized[in_range] = ((values[in_range] - lo) / (hi - lo) * 255.0).astype(np.uint8)
 
         colorized = cv2.applyColorMap(normalized, cv2.COLORMAP_JET)
         colorized = cv2.cvtColor(colorized, cv2.COLOR_BGR2RGB)
@@ -243,6 +265,7 @@ class Camera:
             self.camera_calibrated = True
 
             self._update_workspace_transform()
+            self.estimate_depth_bias()
 
             cam_pos_world = self.extrinsic_matrix_inv[:3, 3]
             return True, f"Calibrated! Camera position in World Frame: ({cam_pos_world[0]:.1f}, {cam_pos_world[1]:.1f}, {cam_pos_world[2]:.1f})"
@@ -272,7 +295,7 @@ class Camera:
 
     def image_to_world(self, x, y):
         """Pixel (x, y) -> world-frame (X, Y, Z) in mm using live depth."""
-        d_raw = self.depth_frame_raw[int(y), int(x)]
+        d_raw = self.depth_frame_adjusted[int(y), int(x)]
         p_cam = self.depth_to_camera_point(x,y,d_raw)
         return self.camera_to_world(p_cam)
 
@@ -302,12 +325,6 @@ class Camera:
             [WORKSPACE_MARGIN_MM, WORKSPACE_MARGIN_MM],
         ])
 
-        src_pts = np.array([
-            [303, 562],
-            [1088, 551],
-            [1154, 91],
-            [232, 112]
-        ])
         matched_dest_pts = []
 
         for tag_id, dest in zip(self.tag_world_points, dest_pts):
@@ -318,7 +335,7 @@ class Camera:
 
         dest_pts = np.array(matched_dest_pts, dtype=np.float64)
 
-        H, _ = cv2.findHomography(src_pts, dest_pts)
+        H, _ = cv2.findHomography(CORNER_POINTS, dest_pts)
 
         if H is not None:
             self.workspace_homography = H
@@ -355,6 +372,8 @@ class Camera:
         return img_pts.reshape(-1, 2)
 
     def project_grid(self):
+        if not self.grid_enabled or self.workspace_homography is None:
+            return
 
         xsteps = int((MAX_X - MIN_X)/TILE_SIZE_MM) + 1
         xs = np.linspace(MIN_X, MAX_X, xsteps)
@@ -365,16 +384,18 @@ class Camera:
         X, Y = np.meshgrid(xs, ys)
         world_pts = np.stack([X.ravel(), Y.ravel(), np.zeros(X.size)], axis=1)
 
-        frame = self.video_frame.copy()
         img_pts = self.project_world_points(world_pts)
-        if img_pts is not None:
-            for u, v in img_pts:
-                cv2.circle(frame, (int(u), int(v)), 3, (0, 255, 255), -1)
+        if img_pts is None:
+            return
 
-        self.grid_frame = frame
+        # img_pts are raw-image pixels; carry them through the same homography
+        # used for the workspace view so the dots land on the rectified frame.
+        ws_pts = cv2.perspectiveTransform(img_pts.reshape(-1, 1, 2), self.workspace_homography).reshape(-1, 2)
+        for u, v in ws_pts:
+            cv2.circle(self.workspace_frame, (int(u), int(v)), 3, (0, 255, 255), -1)
 
     def heat_map(self):
-        if not self.heat_map_enabled or self.workspace_homography_inv is None:
+        if not self.heat_map_enabled or self.workspace_homography_inv is None or self.world_z_frame is None:
             return
 
         x_ws = np.linspace(50, 1234, 100)
@@ -390,11 +411,11 @@ class Camera:
                 px = px / px[2]
                 x_px, y_px = px[0], px[1]
 
-                world_pt = self.image_to_world(x_px, y_px)
-                if world_pt is None:
+                z = self.world_z_frame[int(y_px), int(x_px)]
+                if np.isnan(z):
                     continue
 
-                z_map[i, j] = world_pt[2]
+                z_map[i, j] = z
 
         # plot: colorize the Z heights (same jet-colormap pattern as colorize_depth_frame).
         # Use percentiles instead of a fixed range so a few outlier-tall pixels (the arm)
@@ -406,11 +427,113 @@ class Camera:
         colorized = cv2.resize(colorized, (COLOR_W, COLOR_H))
         self.workspace_frame = cv2.addWeighted(self.workspace_frame, 0.5, colorized, 0.5, 0)
 
+        # legend: colorbar mapping the jet gradient back to Z height (mm)
+        bar_x, bar_y, bar_w, bar_h = 20, 20, 20, 200
+        bar = np.linspace(255, 0, bar_h, dtype=np.uint8).reshape(-1, 1)
+        bar = cv2.cvtColor(cv2.applyColorMap(np.repeat(bar, bar_w, axis=1), cv2.COLORMAP_JET), cv2.COLOR_BGR2RGB)
+
+        cv2.rectangle(self.workspace_frame, (bar_x - 8, bar_y - 8), (bar_x + 90, bar_y + bar_h + 8), (0, 0, 0), -1)
+        self.workspace_frame[bar_y:bar_y + bar_h, bar_x:bar_x + bar_w] = bar
+        cv2.rectangle(self.workspace_frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (255, 255, 255), 1)
+        cv2.putText(self.workspace_frame, f"{hi:.0f}mm", (bar_x + bar_w + 6, bar_y + 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(self.workspace_frame, f"{lo:.0f}mm", (bar_x + bar_w + 6, bar_y + bar_h),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+    def estimate_depth_bias(self):
+        """
+        Fit a plane err = a*u + b*v + c (mm) to the sensor's depth error over
+        the area between the tags, where err = measured depth - the depth a
+        flat Z=0 table should have given the extrinsics. apply_depth_bias
+        subtracts this plane to make depth_frame_adjusted.
+        """
+        if not self.camera_calibrated or self.depth_frame_raw is None:
+            return
+
+        centers = np.array([list(detection.center.astype(int)) for detection in self.tag_detections])
+            
+        u_max = max(centers[:,0])
+        v_max = max(centers[:,1])
+        u_min = min(centers[:,0])
+        v_min = min(centers[:,1])
+
+        u_ws = np.linspace(u_min, u_max, 100)
+        v_ws = np.linspace(v_min, v_max, 100)
+
+        U, V = np.meshgrid(u_ws, v_ws)
+
+        fx, fy = self.intrinsic_matrix[0, 0], self.intrinsic_matrix[1, 1]
+        cx, cy = self.intrinsic_matrix[0, 2], self.intrinsic_matrix[1, 2]
+        
+        R_cw = self.extrinsic_matrix_inv[:3, :3]
+        cam_pos = self.extrinsic_matrix_inv[:3, 3]
+
+        z = np.zeros(U.shape)
+        z_expected = np.zeros(U.shape)
+
+        for i in range(U.shape[0]):
+            for j in range(U.shape[1]):
+                z[i, j] = self.depth_frame_raw[int(V[i, j]), int(U[i, j])] * self.depth_scale_mm
+                ray = np.array([(U[i, j] - cx) / fx, (V[i, j] - cy) / fy, 1.0])
+                dir_world = R_cw @ ray
+
+                # solve cam_pos[2] + t * dir_world[2] = 0 for where the ray hits the table
+                t = -cam_pos[2] / dir_world[2]
+                z_expected[i, j] = t
+
+        valid = (z > 900)
+
+        u = np.ravel(U[valid])
+        v = np.ravel(V[valid])
+        errors = np.ravel(z[valid] - z_expected[valid])
+
+        A = np.stack([u, v, np.ones_like(u)], axis=1)
+        coeffs, _, _, _ = np.linalg.lstsq(A, errors, rcond=None)
+
+        self.depth_bias_coeffs = coeffs
+        print(f"Depth bias fit: a={coeffs[0]:+.5f}, b={coeffs[1]:+.5f}, c={coeffs[2]:+.2f} mm")
+
+    def update_world_z_frame(self):
+        """Deproject every pixel of depth_frame_adjusted and keep its world Z (mm)."""
+        if not self.camera_calibrated:
+            self.world_z_frame = None
+            return
+        depth_mm = self.depth_frame_adjusted.astype(np.float32) * self.depth_scale_mm
+        h, w = depth_mm.shape
+        V, U = np.mgrid[0:h, 0:w]
+        fx, fy = self.intrinsic_matrix[0, 0], self.intrinsic_matrix[1, 1]
+        cx, cy = self.intrinsic_matrix[0, 2], self.intrinsic_matrix[1, 2]
+        x_c = (U - cx) / fx * depth_mm
+        y_c = (V - cy) / fy * depth_mm
+
+        z_row = self.extrinsic_matrix_inv[2]  # row that gives world Z
+        world_z = (z_row[0] * x_c + z_row[1] * y_c + z_row[2] * depth_mm + z_row[3]).astype(np.float32)
+        world_z[depth_mm == 0] = np.nan
+        self.world_z_frame = world_z
+
+    def apply_depth_bias(self):
+        """
+        Subtract the fitted sensor error plane from depth_frame_raw into
+        depth_frame_adjusted. depth_frame_raw is left untouched.
+        """
+        self.depth_frame_adjusted = self.depth_frame_raw
+        if self.depth_bias_coeffs is None:
+            return
+        a, b, c = self.depth_bias_coeffs
+        h, w = self.depth_frame_raw.shape
+        V, U = np.mgrid[0:h, 0:w]
+        plane_mm = a * U + b * V + c
+
+        depth_mm = self.depth_frame_raw.astype(np.float64) * self.depth_scale_mm
+        adjusted_mm = np.clip(depth_mm - plane_mm, 0, None)
+        adjusted_mm[self.depth_frame_raw == 0] = 0
+        self.depth_frame_adjusted = (adjusted_mm / self.depth_scale_mm).astype(np.uint16)
+
 
 class VideoThread(QThread):
     """Polls the RealSense pipeline at ~30 Hz and emits Qt signals for the GUI."""
 
-    updateFrame = pyqtSignal(QImage, QImage, QImage, QImage, QImage)
+    updateFrame = pyqtSignal(QImage, QImage, QImage, QImage)
 
     def __init__(self, camera, parent=None):
         QThread.__init__(self, parent=parent)
@@ -452,6 +575,8 @@ class VideoThread(QThread):
 
             self.camera.video_frame = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
             self.camera.depth_frame_raw = depth
+            self.camera.apply_depth_bias()
+            self.camera.update_world_z_frame()
             self.camera.colorize_depth_frame()
 
             if self._frame_counter % self.camera.tag_detect_interval == 0:
@@ -468,10 +593,9 @@ class VideoThread(QThread):
             depth_qt = self.camera._to_qimage(self.camera.depth_frame_rgb)
             tag_qt   = self.camera._to_qimage(self.camera.tag_image_frame)
             workspace_qt = self.camera._to_qimage(self.camera.workspace_frame)
-            grid_qt = self.camera._to_qimage(self.camera.grid_frame)
 
-            if rgb_qt and depth_qt and tag_qt and workspace_qt and grid_qt:
-                self.updateFrame.emit(rgb_qt, depth_qt, tag_qt, workspace_qt, grid_qt)
+            if rgb_qt and depth_qt and tag_qt and workspace_qt:
+                self.updateFrame.emit(rgb_qt, depth_qt, tag_qt, workspace_qt)
 
             elapsed = time.time() - start
             time.sleep(max(0.0, 1 / 30 - elapsed))
@@ -489,7 +613,7 @@ if __name__ == '__main__':
     print(f"Intrinsic matrix:\n{camera.intrinsic_matrix}")
 
     wins = {}
-    for title in ("RGB", "Depth", "Tags", "Workspace", "Grid"):
+    for title in ("RGB", "Depth", "Tags", "Workspace"):
         label = QLabel(title)
         label.setWindowTitle(title)
         label.setAlignment(Qt.AlignCenter)
@@ -497,9 +621,9 @@ if __name__ == '__main__':
         label.show()
         wins[title] = label
 
-    @pyqtSlot(QImage, QImage, QImage, QImage, QImage)
-    def on_frame(rgb, depth, tags, workspace, grid):
-        for label, image in zip(wins.values(), (rgb, depth, tags, workspace, grid)):
+    @pyqtSlot(QImage, QImage, QImage, QImage)
+    def on_frame(rgb, depth, tags, workspace):
+        for label, image in zip(wins.values(), (rgb, depth, tags, workspace)):
             label.setPixmap(
                 QPixmap.fromImage(image).scaled(
                     label.size(),
