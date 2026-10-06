@@ -10,6 +10,10 @@ import numpy as np
 from numpy import *
 from scipy.linalg import expm
 from scipy.optimize import least_squares
+from scipy.spatial.transform import Rotation
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+from matplotlib.patches import Rectangle, Circle
 
 
 # ======================================================================
@@ -277,11 +281,11 @@ def compute_jacobian(dh_params, q, residual_func, base_res, eps=1e-6):
     """Computes the 6x6 numerical Jacobian using finite differences."""
     J = np.zeros((6, 6))
     for i in range(6):
-        q_perturbed = q.copy()
-        q_perturbed[i] += eps
-        res_perturbed = residual_func(q_perturbed)
+        q_delta = q.copy()
+        q_delta[i] += eps
+        res_delta = residual_func(q_delta)
         # Forward finite difference
-        J[:, i] = (res_perturbed - base_res) / eps
+        J[:, i] = (res_delta - base_res) / eps
     return J
 
 
@@ -314,7 +318,7 @@ def IK_numerical(dh_params, pose, q0=None, joint_limits=None, w_rot=200.0):
     lo = joint_limits[:, 0]
     hi = joint_limits[:, 1]
     
-    # Custom optimization loop hyperparameters
+    # Custom optimization parameters
     max_steps = 150
     pos_tol = 0.1       # 0.1 mm position accuracy limit
     rot_tol = 0.005     # 0.005 rad orientation accuracy limit
@@ -325,7 +329,7 @@ def IK_numerical(dh_params, pose, q0=None, joint_limits=None, w_rot=200.0):
     p_target = np.array([x, y, z], dtype=float)
 
     def calculate_residual(q_curr):
-        """Six-vector: [position_err (mm), w_rot * rotation_vec (mm-equivalent)]."""
+        "Finding the position error the orientational offset"
         T = FK_dh(dh_params, q_curr, 6)
         p = T[:3, 3]
         R = T[:3, :3]
@@ -426,7 +430,6 @@ def error_test(arm, iterations=100):
     print(f"Position Error Mean: {np.mean(pos_err)}, Median: {np.median(pos_err)}, Max: {np.max(pos_err)}, 95%: {np.percentile(pos_err, 95)}")
     print(f"Orientation Error Mean: {np.mean(or_err)}, Median: {np.median(or_err)}, Max: {np.max(or_err)}, 95%: {np.percentile(or_err, 95)}")
 
-    import matplotlib.pyplot as plt
 
     plt.figure()
     plt.hist(pos_err, bins=30)
@@ -455,7 +458,6 @@ def _ik_pose_error(T_target, q):
 
 def _ik_numerical_lsq(pose, q0=Q_DEFAULT, w_rot=200.0):
     """Bounded least squares on [position error, w_rot * rotation-vector error], seeded from home."""
-    from scipy.spatial.transform import Rotation
 
     lower, upper = JOINT_LIMITS[:, 0], JOINT_LIMITS[:, 1]
     p_t = np.asarray(pose[:3], dtype=float)
@@ -476,13 +478,13 @@ def _ik_numerical_lsq(pose, q0=Q_DEFAULT, w_rot=200.0):
     return sol.x
 
 
-def _ik_round_trip(solvers, iterations, seed, title):
+def _ik_round_trip(solvers, iterations, seed, title, separate=False):
     """
     Draw random q inside JOINT_LIMITS, FK -> IK -> FK through each solver, and
     compare poses (not angles: a different branch reaching the same pose is fine).
-    Prints mean/max position and orientation error per solver and plots histograms.
+    Prints mean/max position and orientation error per solver and plots histograms:
+    overlaid on one figure, or with separate=True one subplot per solver per error type.
     """
-    import matplotlib.pyplot as plt
 
     rng = np.random.default_rng(seed)
     qs = rng.uniform(JOINT_LIMITS[:, 0], JOINT_LIMITS[:, 1], size=(iterations, 6))
@@ -510,6 +512,21 @@ def _ik_round_trip(solvers, iterations, seed, title):
         print(f"{name:<14}{len(pos):>8}{pos.mean():>10.2e}mm{pos.max():>10.2e}mm"
               f"{ori.mean():>9.2e}deg{ori.max():>9.2e}deg")
 
+    if separate:
+        # one subplot per solver (rows) per error type (columns)
+        metrics = (("pos", "Position error (mm)"), ("ori", "Orientation error (deg)"))
+        fig, axes = plt.subplots(len(results), 2, figsize=(11, 3.5 * len(results)), squeeze=False)
+        for row, (name, r) in zip(axes, results.items()):
+            for ax, (key, label) in zip(row, metrics):
+                if r[key]:
+                    ax.hist(r[key], bins=30)
+                ax.set_xlabel(label)
+                ax.set_ylabel("Count")
+                ax.set_title(f"{name}: {label.split(' (')[0].lower()}")
+        fig.suptitle(title)
+        fig.tight_layout()
+        return results
+
     fig, axes = plt.subplots(1, 2, figsize=(11, 4))
     for name, r in results.items():
         if r["pos"]:
@@ -531,13 +548,13 @@ def error_test_ik(iterations=300, seed=0):
     IK round trip inside our own model: IK_geometric vs the numerical solver.
     No hardware needed, and no error floor - both should come back exact.
     """
-    import matplotlib.pyplot as plt
 
     solvers = {
         "IK_geometric": lambda pose: IK_geometric(DH_STD, pose),
         "IK_numerical": _ik_numerical_lsq,
     }
-    results = _ik_round_trip(solvers, iterations, seed, "IK round trip (geometric vs numerical)")
+    results = _ik_round_trip(solvers, iterations, seed, "IK round trip (geometric vs numerical)",
+                             separate=True)
     plt.show()
     return results
 
@@ -548,13 +565,16 @@ def error_test_ik_vendor(arm, iterations=300, seed=0):
     with our FK. Needs the real arm, but the arm never moves. The vendor uses a
     per-arm factory calibration our model lacks, so allow up to 10 mm.
     """
-    import matplotlib.pyplot as plt
 
     def ik_vendor(pose):
         code, q = arm.xarm.get_inverse_kinematics(list(pose))
         return np.array(q[:6], dtype=float) if code == 0 else None
 
-    results = _ik_round_trip({"vendor (SDK)": ik_vendor}, iterations, seed, "IK vs vendor")
+    solvers = {
+            "IK_numerical": _ik_numerical_lsq,
+            "vendor (SDK)": ik_vendor
+        }
+    results = _ik_round_trip(solvers, iterations, seed, "IK vs vendor", separate=True)
     pos = np.array(results["vendor (SDK)"]["pos"])
     if len(pos):
         print(f"vendor: {np.mean(pos <= 10.0) * 100:.1f}% of solved poses within the 10 mm allowance")
@@ -571,9 +591,6 @@ def reachability_map(blocks=(38.0, 25.0), step=10.0, flange_above_center=85.0):
     aligned to the board grid (yaw = 0) and turned 90 deg (yaw = pi/2). A point
     is reachable if IK_geometric returns a solution inside the joint limits.
     """
-    import matplotlib.pyplot as plt
-    from matplotlib.colors import ListedColormap
-    from matplotlib.patches import Rectangle, Circle
 
     # Board extents, matching camera.py (MIN_X..MAX_X, MIN_Y..MAX_Y).
     board_x, board_y = (-50.0, 450.0), (-450.0, 450.0)

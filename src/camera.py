@@ -529,6 +529,147 @@ class Camera:
         adjusted_mm[self.depth_frame_raw == 0] = 0
         self.depth_frame_adjusted = (adjusted_mm / self.depth_scale_mm).astype(np.uint16)
 
+    def _classify_hsv(self, hsv_pixel):
+        """
+        Robust HSV -> color name mapping.
+        Expects a 1D array or tuple: [h, s, v] where H is 0..179, S and V are 0..255.
+        """
+        h, s, v = hsv_pixel[0], hsv_pixel[1], hsv_pixel[2]
+
+        # 1. Handle desaturated / dark pixels first (adjust thresholds based on lighting)
+        if v < 40:          return "black"   # Too dark to see color
+        if s < 40 and v > 200: return "white"   # Very bright and desaturated
+        if s < 30:          return "gray"    # Dull / metallic desaturated surfaces
+
+        # 2. Check Hue boundaries (OpenCV H is bounded 0..179)
+        if h < 10 or h >= 170:  return "red"
+        if 10  <= h < 22:       return "orange"  # Slightly widened for warm lighting
+        if 22  <= h < 38:       return "yellow"  # Adjusted to catch pale/bright yellows
+        if 38  <= h < 85:       return "green"   # Standard green boundary
+        if 85  <= h < 102:      return "cyan"
+        if 102 <= h < 135:      return "blue"
+        if 135 <= h < 170:      return "magenta"
+        
+        return "unknown"
+
+    def detect_blocks(self):
+        """Populate self.block_detections from the current workspace view."""
+        self.block_detections = []
+
+        if self.world_z_frame is None or self.video_frame is None or self.depth_frame_raw is None:
+            return
+
+        h = cv2.warpPerspective(self.world_z_frame, self.workspace_homography, 
+                                (COLOR_W, COLOR_H), flags=cv2.INTER_NEAREST, 
+                                borderValue=float("nan"))
+        
+        # Step 4: Define a baseline mask to find ALL block footprints (Level 1)
+        # Keeps block tops (starting at 15mm) and rejects table/tags noise.
+        mask_l1 = ((h > 10.0) & (h < 48.0)).astype(np.uint8) * 255
+        kernel = np.ones((5, 5), np.uint8)
+        mask_l1 = cv2.morphologyEx(mask_l1, cv2.MORPH_OPEN, kernel)
+
+        # Separate height bands at multiples of block height for stack counting
+        mask_l2 = ((h >= 48.0) & (h < 85.0)).astype(np.uint8) * 255
+        mask_l3 = (h >= 85.0).astype(np.uint8) * 255
+
+        contours, _ = cv2.findContours(mask_l1, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return
+
+        hsv = cv2.cvtColor(self.workspace_frame, cv2.COLOR_RGB2HSV)
+
+        for cnt in contours:
+            # Step 5: Filter contours by area before trusting them
+            area_px = cv2.contourArea(cnt)
+            if area_px < 300:  # Noise cutoff
+                continue
+                
+            rect = cv2.minAreaRect(cnt)
+            (cx, cy), (w_px, h_px), angle = rect
+
+            # Side lengths convert straight to millimeters via uniform tag scale
+            size_px = 0.5 * (w_px + h_px)
+            
+            # Separates valid blocks from touching blocks or the robot arm
+            if size_px < 15.0 or size_px > 70.0:
+                continue
+
+            # Orientation angle handling (modulo 90 degrees for square blocks)
+            if w_px < h_px:
+                angle_fixed = angle + 90.0
+            else:
+                angle_fixed = angle
+            angle_bounded = angle_fixed % 90.0
+
+            # Step 4 (Cont.): Count stack levels a contour reaches using the bands
+            # We check if the upper bands have any active pixels within this block's region
+            contour_mask = np.zeros(mask_l1.shape, np.uint8)
+            cv2.drawContours(contour_mask, [cnt], -1, 255, -1)
+            
+            stack_count = 1
+            if np.any((mask_l2 > 0) & (contour_mask > 0)):
+                stack_count = 2
+            if np.any((mask_l3 > 0) & (contour_mask > 0)):
+                stack_count = 3
+
+            # Step 6: Color from RGB image inside an eroded mask
+            block_mask = contour_mask.copy()
+            block_mask = cv2.erode(block_mask, kernel, iterations=2)
+            hsv_px = hsv[block_mask > 0]
+            
+            color = "unknown"
+            if hsv_px.size > 0:
+                # Median, not mean, so specular highlights don't pull the value
+                hsv_med = np.median(hsv_px, axis=0)
+                color = self._classify_hsv(hsv_med)
+
+            # Step 7: Position in the world using ORIGINAL depth via inverse homography
+            cam = self.workspace_pixel_to_image(cx, cy)
+            world = None
+            if cam is not None:
+                # Map back to original image space
+                u0 = int(np.clip(round(cam[0]), 0, self.depth_frame_raw.shape[1] - 1))
+                v0 = int(np.clip(round(cam[1]), 0, self.depth_frame_raw.shape[0] - 1))
+                
+                # Crucial Fix: Read depth from ORIGINAL unflattened frame, not world_z_frame!
+                # Flattening was for thresholding and changed the raw numbers.
+                raw_depth_sample = float(self.depth_frame_raw[v0, u0]) * self.depth_scale_mm
+                
+                if raw_depth_sample > 0:
+                    # Pass the original pixel and its true depth to image_to_world
+                    world = self.image_to_world(u0, v0)
+                
+            if world is None:
+                continue
+
+            self.block_detections.append({
+                "x": float(world[0]), 
+                "y": float(world[1]), 
+                "z": float(world[2]),
+                "center_uv": [cx, cy],
+                "rect": rect,
+                "color": color,
+                "size_px": float(size_px), 
+                "orientation_deg": float(angle_bounded),
+                "stack_count": stack_count
+            })
+
+
+    def draw_block_detections(self):
+        """Draw detected blocks onto self.workspace_frame."""
+        for det in self.block_detections:
+            #cx, cy = det["center_uv"]
+            #label = f'{det["color"]} {det["size_px"]:.0f}mm ({det["x"]:.0f},{det["y"]:.0f})'
+            #cv2.circle(self.workspace_frame, (int(cx), int(cy)), 6, (255, 0, 0), -1)
+            #cv2.putText(self.workspace_frame, label,
+                       # (int(cx) - 60, int(cy) - 12),
+                      #  cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
+
+            # Rotated rectangle from minAreaRect, drawn as a closed outline.
+            box = np.int32(cv2.boxPoints(det["rect"]))
+            cv2.drawContours(self.workspace_frame, [box], 0, (0, 255, 0), 2)
+
 
 class VideoThread(QThread):
     """Polls the RealSense pipeline at ~30 Hz and emits Qt signals for the GUI."""
@@ -586,6 +727,8 @@ class VideoThread(QThread):
 
             self.camera.draw_tags_in_rgb_image()
             self.camera.update_workspace_frame()
+            self.camera.detect_blocks()
+            self.camera.draw_block_detections()
             self.camera.heat_map()
             self.camera.project_grid()
 
