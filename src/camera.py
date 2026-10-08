@@ -85,6 +85,7 @@ class Camera:
         self.tag_detections = []
         self.tag_detect_interval = 6  # ~5 Hz at 30 FPS
         self.depth_scale_mm = 1.0   # raw depth units -> mm; overwritten once the pipeline starts
+        self.pixel_to_mm = 2/3
         self._pipeline_running = False
         self.camera_connected = False
 
@@ -542,8 +543,8 @@ class Camera:
         if s < 30:          return "gray"    # Dull / metallic desaturated surfaces
 
         # 2. Check Hue boundaries (OpenCV H is bounded 0..179)
-        if h < 10 or h >= 170:  return "red"
-        if 10  <= h < 22:       return "orange"  # Slightly widened for warm lighting
+        if h < 4 or h >= 170:  return "red"
+        if 4  <= h < 22:       return "orange"  # Slightly widened for warm lighting
         if 22  <= h < 38:       return "yellow"  # Adjusted to catch pale/bright yellows
         if 38  <= h < 85:       return "green"   # Standard green boundary
         if 85  <= h < 102:      return "cyan"
@@ -564,14 +565,20 @@ class Camera:
                                 borderValue=float("nan"))
         
         # Step 4: Define a baseline mask to find ALL block footprints (Level 1)
-        # Keeps block tops (starting at 15mm) and rejects table/tags noise.
-        mask_l1 = ((h > 10.0) & (h < 48.0)).astype(np.uint8) * 255
+        # Possible block tops: 1 block 25/38 mm, 2 blocks 50-76 mm, 3 blocks 75-114 mm.
+        # 15 mm floor rejects table/tag noise (shortest top is 25 mm); 125 mm cap keeps
+        # a 3-high stack of 38 mm blocks (114 mm) but drops most of the arm.
+        # mask_l1 = ((h > 11.0) & (h < 125.0)).astype(np.uint8) * 255
+        mask_l1 = ((h > 11.0) & (h < 300.0)).astype(np.uint8) * 255
         kernel = np.ones((5, 5), np.uint8)
         mask_l1 = cv2.morphologyEx(mask_l1, cv2.MORPH_OPEN, kernel)
 
-        # Separate height bands at multiples of block height for stack counting
-        mask_l2 = ((h >= 48.0) & (h < 85.0)).astype(np.uint8) * 255
-        mask_l3 = (h >= 85.0).astype(np.uint8) * 255
+        # Separate height bands for stack counting, split halfway between levels:
+        #   2+ blocks: above the tallest single block (38) -> 44 mm
+        #   3+ blocks: above the tallest 2-stack (76)      -> 82 mm
+        # 3 x 25 mm (75 mm) overlaps 2 x 38 mm (76 mm) and reads as 2 here.
+        mask_l2 = ((h >= 44.0) & (h < 82.0)).astype(np.uint8) * 255
+        mask_l3 = ((h >= 82.0) & (h < 125.0)).astype(np.uint8) * 255
 
         contours, _ = cv2.findContours(mask_l1, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
@@ -581,18 +588,30 @@ class Camera:
 
         for cnt in contours:
             # Step 5: Filter contours by area before trusting them
+            # Workspace view is ~1.25-1.3 px/mm: a 25 mm block top is ~32 px (~1000 px^2),
+            # a 38 mm block top ~50 px (~2500 px^2). Allow ~25% margin either side.
             area_px = cv2.contourArea(cnt)
-            if area_px < 300:  # Noise cutoff
+            if area_px < 300 or area_px > 10000:
                 continue
                 
             rect = cv2.minAreaRect(cnt)
             (cx, cy), (w_px, h_px), angle = rect
 
-            # Side lengths convert straight to millimeters via uniform tag scale
+            # Side length in workspace pixels (not mm; see scale note above)
             size_px = 0.5 * (w_px + h_px)
-            
+
+            size_mm = size_px*self.pixel_to_mm
+
             # Separates valid blocks from touching blocks or the robot arm
-            if size_px < 15.0 or size_px > 70.0:
+            if size_px < 24.0 or size_px > 150.0:
+                continue
+
+            # Shape tests: a block top is a compact, convex square; wires and
+            # edge noise are long, thin, or ragged.
+            rectangularity = area_px / max(w_px * h_px, 1.0)                     # ~0.85-1.0 for a block
+            aspect = max(w_px, h_px) / max(min(w_px, h_px), 1.0)                 # ~1.0-1.3 for a block
+            solidity = area_px / max(cv2.contourArea(cv2.convexHull(cnt)), 1.0)  # ~0.9+ for a block
+            if rectangularity < 0.75 or aspect > 1.5 or solidity < 0.85:
                 continue
 
             # Orientation angle handling (modulo 90 degrees for square blocks)
@@ -650,7 +669,7 @@ class Camera:
                 "center_uv": [cx, cy],
                 "rect": rect,
                 "color": color,
-                "size_px": float(size_px), 
+                "size_mm": float(size_mm), 
                 "orientation_deg": float(angle_bounded),
                 "stack_count": stack_count
             })
@@ -659,12 +678,12 @@ class Camera:
     def draw_block_detections(self):
         """Draw detected blocks onto self.workspace_frame."""
         for det in self.block_detections:
-            #cx, cy = det["center_uv"]
-            #label = f'{det["color"]} {det["size_px"]:.0f}mm ({det["x"]:.0f},{det["y"]:.0f})'
-            #cv2.circle(self.workspace_frame, (int(cx), int(cy)), 6, (255, 0, 0), -1)
-            #cv2.putText(self.workspace_frame, label,
-                       # (int(cx) - 60, int(cy) - 12),
-                      #  cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
+            cx, cy = det["center_uv"]
+            label = f'{det["orientation_deg"]:.0f} deg, \n{det["size_mm"]:.0f}mm \n({det["x"]:.0f},{det["y"]:.0f}, {det["z"]:.0f})'
+            cv2.circle(self.workspace_frame, (int(cx), int(cy)), 6, (255, 0, 0), -1)
+            cv2.putText(self.workspace_frame, label,
+                    (int(cx) - 60, int(cy) - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
 
             # Rotated rectangle from minAreaRect, drawn as a closed outline.
             box = np.int32(cv2.boxPoints(det["rect"]))
